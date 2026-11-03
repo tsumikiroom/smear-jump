@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#efeae0">
+<title>Smear Jump</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  --paper: #efeae0; --ink: #1d1d1f; --mute: #6e6a63; --bar: rgba(255,253,248,.9);
+  --edge: rgba(0,0,0,.12); --hot: #e2482f;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --ink:#f1efe9; --mute:#a5a198; --bar:rgba(28,28,30,.92); --edge:rgba(255,255,255,.14); color-scheme:dark; }
+}
+:root[data-theme="dark"] { --ink:#f1efe9; --mute:#a5a198; --bar:rgba(28,28,30,.92); --edge:rgba(255,255,255,.14); color-scheme:dark; }
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body {
+  margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none;
+  background: var(--paper); color: var(--ink); touch-action: none;
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  font: 15px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+#stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+#msg {
+  position: fixed; left: 16px; right: 16px; top: calc(env(safe-area-inset-top, 0px) + 16px);
+  text-align: center; color: var(--mute); pointer-events: none; transition: opacity .5s;
+}
+#dock {
+  position: fixed; left: 0; right: 0; bottom: 0;
+  padding: 10px max(16px, env(safe-area-inset-right, 0px)) calc(env(safe-area-inset-bottom, 0px) + 12px) max(16px, env(safe-area-inset-left, 0px));
+  background: var(--bar); border-top: 1px solid var(--edge);
+  -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
+}
+.line { display: flex; gap: 8px; align-items: center; }
+.line + .line { margin-top: 8px; }
+button {
+  font: inherit; color: var(--ink); background: transparent; touch-action: manipulation;
+  border: 1px solid var(--edge); border-radius: 12px; min-height: 48px; min-width: 48px; padding: 0 12px;
+}
+button.on { background: var(--hot); border-color: var(--hot); color: #fff; }
+#pics { flex: 1; display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; touch-action: pan-x; }
+#pics::-webkit-scrollbar { display: none; }
+#pics button { flex: 0 0 auto; width: 52px; height: 52px; padding: 3px; background: rgba(127,127,127,.08); border: 2px solid transparent; }
+#pics button.on { border-color: var(--hot); background: rgba(127,127,127,.08); }
+#pics canvas { width: 100%; height: 100%; display: block; }
+#speed button { flex: 1; padding: 0 4px; }
+#knobs { display: none; margin-top: 8px; max-height: 40vh; overflow-y: auto; touch-action: pan-y; }
+#knobs.open { display: block; }
+#knobs label { display: grid; grid-template-columns: 6.6em 1fr 3.4em; gap: 10px; align-items: center; min-height: 40px; }
+#knobs output { text-align: right; color: var(--mute); font-variant-numeric: tabular-nums; }
+#knobs input { width: 100%; height: 32px; accent-color: var(--hot); touch-action: pan-y; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="msg">Tap anywhere — the picture jumps there</div>
+<div id="dock">
+  <div class="line">
+    <div id="pics"></div>
+    <button id="knobToggle" aria-expanded="false">Knobs</button>
+  </div>
+  <div class="line" id="speed">
+    <button data-rate="1" class="on">1×</button>
+    <button data-rate="0.25">1/4</button>
+    <button data-rate="0.0625">1/16</button>
+    <button data-rate="0">Stop</button>
+  </div>
+  <div id="knobs"></div>
+</div>
+
+<script type="x-shader/x-vertex" id="vert">#version 300 es
+void main() {
+  // one triangle that covers the screen
+  vec2 c = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(c * 2.0 - 1.0, 0.0, 1.0);
+}
+</script>
+
+<script type="x-shader/x-fragment" id="frag">#version 300 es
+precision highp float;
+precision highp int;
+
+uniform sampler2D uPic;     // premultiplied picture, y up
+uniform sampler2D uFront;   // per row of the jump frame: first opaque x seen from the leading side
+uniform vec2  uView;        // drawing buffer size in pixels
+uniform vec2  uFrom;        // jump start (screen units: height 1, origin at centre)
+uniform vec2  uDir;         // cos, sin of the jump heading
+uniform vec2  uTurn;        // cos, sin of (heading - picture rotation)
+uniform float uLen;         // jump length
+uniform float uDur;         // jump duration (s)
+uniform float uAge;         // time since the jump started (s)
+uniform float uLag;         // base lag per band (s)
+uniform float uSpread;      // 0..1 how much the lag differs between bands
+uniform float uStretch;     // trail exaggeration
+uniform float uBands;       // bands across the picture
+uniform float uJag;         // 0..1 random shift of band borders
+uniform float uArc;         // signed arc height (fraction of the jump length)
+uniform float uSize;        // picture edge length
+uniform uint  uSeed;
+uniform vec3  uPaper;
+out vec4 outColor;
+
+float rnd(int n) {
+  uint x = uint(n) * 747796405u + uSeed * 2891336453u;
+  x = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
+  x = (x >> 22u) ^ x;
+  return float(x) / 4294967295.0;
+}
+
+float travel(float t) {                  // smootherstep along the jump
+  float s = clamp(t / max(uDur, 1e-4), 0.0, 1.0);
+  return uLen * s * s * s * (s * (s * 6.0 - 15.0) + 10.0);
+}
+
+float lift(float x) {                    // sideways offset of the arc path
+  float s = x / max(uLen, 1e-5);
+  return uArc * uLen * 4.0 * s * (1.0 - s);
+}
+
+float frontAt(float y) {
+  float reach = uSize * 0.7072;
+  int n = textureSize(uFront, 0).x;
+  float f = (y + reach) / (2.0 * reach);
+  if (f < 0.0 || f >= 1.0) return 1e9;
+  return texelFetch(uFront, ivec2(int(f * float(n)), 0), 0).r * uSize;
+}
+
+void main() {
+  vec2 s = (gl_FragCoord.xy / uView - 0.5) * vec2(uView.x / uView.y, 1.0) - uFrom;
+  vec2 p = vec2(dot(s, uDir), dot(s, vec2(-uDir.y, uDir.x)));   // jump frame: x along the heading
+
+  float head = travel(uAge);
+  float tailRef = travel(uAge - uLag);
+  float y = p.y - lift(clamp(p.x, tailRef, head));                // follow the arc
+
+  // which band this row belongs to, with randomly shifted borders
+  float by = (y / uSize + 0.5) * uBands;
+  int r = int(floor(by));
+  float lo = float(r) + uJag * (rnd(r) - 0.5) * 0.9;
+  float hi = float(r + 1) + uJag * (rnd(r + 1) - 0.5) * 0.9;
+  int band = by < lo ? r - 1 : (by >= hi ? r + 1 : r);
+
+  float lag = uLag * mix(1.0, 0.35 + 1.3 * rnd(band + 7919), uSpread);
+  float tail = travel(uAge - lag);
+  float span = (head - tail) * uStretch + uSize;   // the last uSize of picture gets spread over this
+
+  float lx = p.x - head;
+  float fr = frontAt(y);
+  float qx = lx;
+  if (fr < 1e7 && lx < fr) qx = fr - (fr - lx) * (uSize / span);
+
+  vec2 uv = vec2(uTurn.x * qx - uTurn.y * y, uTurn.y * qx + uTurn.x * y) / uSize + 0.5;
+  vec4 c = vec4(0.0);
+  if (all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)))) c = texture(uPic, uv);
+  outColor = vec4(c.rgb + uPaper * (1.0 - c.a), 1.0);
+}
+</script>
+
+<script>
+'use strict';
+const PAPER = [0xef / 255, 0xea / 255, 0xe0 / 255];
+const TEX = 512;          // picture resolution
+const FRONT_ROWS = 360;   // rows of the leading-edge table
+
+const msg = document.getElementById('msg');
+window.addEventListener('error', e => { msg.textContent = 'Error: ' + e.message; msg.style.opacity = 1; });
+
+// ---------- knobs ----------
+const KNOBS = [
+  ['dur',     'Jump time', 0.1, 1.2, 0.01, 0.35, 's'],
+  ['lag',     'Lag',       0,   0.4, 0.01, 0.12, 's'],
+  ['stretch', 'Stretch',   1,   10,  0.1,  4,    '×'],
+  ['bands',   'Bands',     2,   60,  1,    20,   ''],
+  ['jag',     'Jag',       0,   1,   0.01, 0.8,  ''],
+  ['spread',  'Lag spread',0,   1,   0.01, 0.7,  ''],
+  ['arc',     'Arc',      -1,   1,   0.05, 0,    ''],
+  ['spin',    'Spin',     -2,   2,   0.25, 0,    ' turn'],
+  ['size',    'Size',      0.1, 0.6, 0.01, innerWidth < innerHeight ? 0.22 : 0.3, ''],
+];
+const K = {};
+for (const [key, , , , , v] of KNOBS) K[key] = v;
+const q = new URLSearchParams(location.search);   // knob overrides, e.g. ?arc=0.4&spin=1
+for (const [key] of KNOBS) if (q.has(key)) K[key] = parseFloat(q.get(key));
+
+// ---------- pictures drawn on canvas ----------
+function makeCanvas() {
+  const c = document.createElement('canvas');
+  c.width = c.height = TEX;
+  const g = c.getContext('2d');
+  g.lineJoin = g.lineCap = 'round';
+  return [c, g];
+}
+const PICS = {
+  word(g) {
+    g.font = '900 200px system-ui, "Arial Black", sans-serif';
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.lineWidth = 26; g.strokeStyle = '#1d1d1f';
+    g.strokeText('JUMP', 256, 200, 470); g.fillStyle = '#e2482f'; g.fillText('JUMP', 256, 200, 470);
+    g.font = '800 120px system-ui, "Arial Black", sans-serif';
+    g.strokeText('!!', 256, 360, 300); g.fillStyle = '#2f6fe2'; g.fillText('!!', 256, 360, 300);
+  },
+  star(g) {
+    g.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + i * Math.PI / 5, r = i % 2 ? 100 : 230;
+      g.lineTo(256 + r * Math.cos(a), 270 + r * Math.sin(a));
+    }
+    g.closePath();
+    g.fillStyle = '#f5c22b'; g.fill(); g.lineWidth = 18; g.strokeStyle = '#1d1d1f'; g.stroke();
+    g.fillStyle = '#1d1d1f';
+    g.beginPath(); g.ellipse(215, 260, 14, 24, 0, 0, 7); g.ellipse(297, 260, 14, 24, 0, 0, 7); g.fill();
+  },
+  ball(g) {
+    g.beginPath(); g.arc(256, 256, 200, 0, 7);
+    g.fillStyle = '#4bb37a'; g.fill(); g.lineWidth = 18; g.strokeStyle = '#1d1d1f'; g.stroke();
+    g.fillStyle = '#fff';
+    g.beginPath(); g.arc(200, 220, 48, 0, 7); g.arc(320, 220, 48, 0, 7); g.fill(); g.stroke();
+    g.fillStyle = '#1d1d1f';
+    g.beginPath(); g.arc(214, 226, 20, 0, 7); g.arc(334, 226, 20, 0, 7); g.fill();
+    g.beginPath(); g.arc(256, 300, 70, 0.15 * Math.PI, 0.85 * Math.PI); g.stroke();
+  },
+  blocks(g) {
+    const cols = ['#e2482f', '#f5c22b', '#2f6fe2', '#4bb37a'];
+    g.lineWidth = 14; g.strokeStyle = '#1d1d1f';
+    [[66, 300, 180, 180], [266, 300, 180, 180], [166, 130, 180, 170], [196, 30, 120, 100]].forEach(([x, y, w, h], i) => {
+      g.fillStyle = cols[i]; g.fillRect(x, y, w, h); g.strokeRect(x, y, w, h);
+    });
+  },
+};
+const pictures = {};
+for (const [name, draw] of Object.entries(PICS)) {
+  const [c, g] = makeCanvas();
+  draw(g);
+  const data = g.getImageData(0, 0, TEX, TEX).data;
+  const alpha = new Uint8Array(TEX * TEX);      // y up, to match the texture
+  for (let y = 0; y < TEX; y++)
+    for (let x = 0; x < TEX; x++) alpha[y * TEX + x] = data[((TEX - 1 - y) * TEX + x) * 4 + 3];
+  pictures[name] = { canvas: c, alpha };
+}
+
+// ---------- WebGL ----------
+const cv = document.getElementById('stage');
+const gl = cv.getContext('webgl2', { antialias: false, premultipliedAlpha: false });
+if (!gl) { msg.textContent = 'This browser does not support WebGL2.'; throw new Error('WebGL2 unavailable'); }
+
+function compile(type, id) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, document.getElementById(id).textContent.trim());
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+  return sh;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, 'vert'));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, 'frag'));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+gl.bindVertexArray(gl.createVertexArray());
+const loc = new Proxy({}, { get: (o, k) => o[k] ?? (o[k] = gl.getUniformLocation(prog, k)) });
+
+function makeTexture(unit, filter) {
+  const t = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+makeTexture(0, gl.LINEAR);
+makeTexture(1, gl.NEAREST);
+gl.uniform1i(loc.uPic, 0);
+gl.uniform1i(loc.uFront, 1);
+
+let current = null;
+function usePicture(name) {
+  current = pictures[name];
+  gl.activeTexture(gl.TEXTURE0);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, current.canvas);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  frontKey = '';
+}
+
+// Leading-edge table. For each row of the jump frame (y across the heading),
+// march from the leading side (+x) and keep the x of the first opaque pixel,
+// in units of the picture size. Only rebuilt when the relative angle changes.
+const frontBuf = new Float32Array(FRONT_ROWS);
+let frontKey = '';
+function buildFronts(c, s) {
+  const key = c.toFixed(4) + ',' + s.toFixed(4);
+  if (key === frontKey) return;
+  frontKey = key;
+  const reach = 0.7072, steps = FRONT_ROWS, a = current.alpha;
+  for (let i = 0; i < FRONT_ROWS; i++) {
+    const y = ((i + 0.5) / FRONT_ROWS * 2 - 1) * reach;
+    let hit = 1e9;
+    for (let j = 0; j < steps; j++) {
+      const x = reach * (1 - 2 * (j + 0.5) / steps);
+      const u = c * x - s * y + 0.5, v = s * x + c * y + 0.5;
+      if (u < 0 || u >= 1 || v < 0 || v >= 1) continue;
+      if (a[(v * TEX | 0) * TEX + (u * TEX | 0)] > 127) { hit = x; break; }
+    }
+    frontBuf[i] = hit;
+  }
+  gl.activeTexture(gl.TEXTURE1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, FRONT_ROWS, 1, 0, gl.RED, gl.FLOAT, frontBuf);
+}
+
+// ---------- motion ----------
+let clock = 0, rate = 1;
+const jump = { fx: 0, fy: 0, tx: 0, ty: 0, start: -100, rot0: 0, rot1: 0, seed: 1 };
+const smoother = s => { s = Math.min(Math.max(s, 0), 1); return s * s * s * (s * (s * 6 - 15) + 10); };
+const age = () => Math.min(Math.max(clock - jump.start, 0), 100);
+const heading = () => Math.atan2(jump.ty - jump.fy, jump.tx - jump.fx);
+const length = () => Math.hypot(jump.tx - jump.fx, jump.ty - jump.fy);
+const arcSign = () => (Math.cos(heading()) >= -1e-6 ? 1 : -1);   // + always bulges upward on screen
+const rotation = () => jump.rot0 + (jump.rot1 - jump.rot0) * smoother(age() / K.dur);
+function position() {
+  const h = heading(), L = length(), x = L * smoother(age() / K.dur);
+  const s = L > 1e-6 ? x / L : 0, off = K.arc * arcSign() * L * 4 * s * (1 - s);
+  return [jump.fx + x * Math.cos(h) - off * Math.sin(h), jump.fy + x * Math.sin(h) + off * Math.cos(h)];
+}
+function jumpTo(x, y) {
+  const [px, py] = position();
+  const r = rotation() % (2 * Math.PI);
+  Object.assign(jump, { fx: px, fy: py, tx: x, ty: y, start: clock, rot0: r, rot1: r + K.spin * 2 * Math.PI,
+                        seed: (Math.random() * 0xffffffff) >>> 0 });
+}
+function tapAt(u, v) {            // u, v in 0..1 from the top-left of the stage
+  const r = cv.getBoundingClientRect();
+  jumpTo((u - 0.5) * r.width / r.height, 0.5 - v);
+  msg.style.opacity = 0;
+}
+cv.addEventListener('pointerdown', e => {
+  const r = cv.getBoundingClientRect();
+  tapAt((e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
+});
+document.addEventListener('gesturestart', e => e.preventDefault());
+document.addEventListener('dblclick', e => e.preventDefault());
+
+function fit() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  cv.width = Math.round(cv.clientWidth * dpr);
+  cv.height = Math.round(cv.clientHeight * dpr);
+  gl.viewport(0, 0, cv.width, cv.height);
+}
+addEventListener('resize', fit);
+fit();
+
+function draw() {
+  const h = heading(), rel = h - rotation();
+  buildFronts(Math.cos(rel), Math.sin(rel));
+  gl.uniform2f(loc.uView, cv.width, cv.height);
+  gl.uniform2f(loc.uFrom, jump.fx, jump.fy);
+  gl.uniform2f(loc.uDir, Math.cos(h), Math.sin(h));
+  gl.uniform2f(loc.uTurn, Math.cos(rel), Math.sin(rel));
+  gl.uniform1f(loc.uLen, length());
+  gl.uniform1f(loc.uDur, K.dur);
+  gl.uniform1f(loc.uAge, age());
+  gl.uniform1f(loc.uLag, K.lag);
+  gl.uniform1f(loc.uSpread, K.spread);
+  gl.uniform1f(loc.uStretch, K.stretch);
+  gl.uniform1f(loc.uBands, K.bands);
+  gl.uniform1f(loc.uJag, K.jag);
+  gl.uniform1f(loc.uArc, K.arc * arcSign());
+  gl.uniform1f(loc.uSize, K.size);
+  gl.uniform1ui(loc.uSeed, jump.seed);
+  gl.uniform3f(loc.uPaper, PAPER[0], PAPER[1], PAPER[2]);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+let prev = performance.now();
+function tick(now) {
+  clock += Math.min((now - prev) / 1000, 0.1) * rate;
+  prev = now;
+  draw();
+  requestAnimationFrame(tick);
+}
+
+// ---------- dock ----------
+const picBox = document.getElementById('pics');
+Object.keys(pictures).forEach((name, i) => {
+  const b = document.createElement('button');
+  b.setAttribute('aria-label', name);
+  const thumb = document.createElement('canvas');
+  thumb.width = thumb.height = 96;
+  thumb.getContext('2d').drawImage(pictures[name].canvas, 0, 0, 96, 96);
+  b.appendChild(thumb);
+  b.onclick = () => { picBox.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b)); usePicture(name); };
+  if (i === 0) b.classList.add('on');
+  picBox.appendChild(b);
+});
+
+const speedBtns = document.querySelectorAll('#speed button');
+function setRate(v) {
+  rate = v;
+  speedBtns.forEach(b => b.classList.toggle('on', parseFloat(b.dataset.rate) === v));
+}
+speedBtns.forEach(b => { b.onclick = () => setRate(parseFloat(b.dataset.rate)); });
+
+const knobBox = document.getElementById('knobs');
+for (const [key, label, min, max, step, , unit] of KNOBS) {
+  const l = document.createElement('label');
+  l.innerHTML = `<span>${label}</span><input type="range" min="${min}" max="${max}" step="${step}" value="${K[key]}"><output></output>`;
+  const input = l.querySelector('input'), out = l.querySelector('output');
+  const show = () => { out.textContent = K[key] + unit; };
+  input.oninput = () => { K[key] = parseFloat(input.value); show(); };
+  show();
+  knobBox.appendChild(l);
+}
+const toggle = document.getElementById('knobToggle');
+function setKnobs(open) {
+  knobBox.classList.toggle('open', open);
+  toggle.classList.toggle('on', open);
+  toggle.setAttribute('aria-expanded', String(open));
+}
+toggle.onclick = () => setKnobs(!knobBox.classList.contains('open'));
+
+// ---------- start ----------
+// URL options for reproducible stills, e.g. ?pic=star&tap=0.75,0.25&t=0.2&arc=0.4
+// tap = target as fractions of the screen (from top-left), t = freeze at this many seconds into the jump.
+const firstPic = pictures[q.get('pic')] ? q.get('pic') : 'word';
+picBox.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.getAttribute('aria-label') === firstPic));
+usePicture(firstPic);
+if (q.get('knobs') === '1') setKnobs(true);
+if (q.has('tap')) {
+  const [u, v] = q.get('tap').split(',').map(Number);
+  tapAt(u, v);
+  if (q.has('seed')) jump.seed = parseInt(q.get('seed'), 10) >>> 0;
+  if (q.has('t')) { clock = jump.start + parseFloat(q.get('t')); setRate(0); }
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

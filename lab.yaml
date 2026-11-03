@@ -1,0 +1,28 @@
+slug: smear-jump
+title: Smear Jump（タップで飛ぶ変形スミア）
+status: active
+priority: 2
+stage: prototype
+summary: タップした位置へ絵が飛び、帯ごとに遅れて引き伸ばされる変形スミアのWebデモ。WebGL2の1枚HTMLで、スマホ幅での表示を確認済み
+question: 手描きアニメのスミアを、どこまで軽い仕組みでリアルタイムに再現できるか
+next:
+  - 実機のスマホで操作感（タップ・つまみ・速度）を確かめる
+  - 弧と回転を大きくしたときの尾の崩れ方を詰める
+  - GitHub Pages で公開する
+blocked_by: ""
+related: []
+knowledge: []
+tags: [webgl2, glsl, animation, smear, mobile]
+cover: results/moving.png
+outputs:
+  - path: results/moving.png
+    caption: 移動中のスミア（帯ごとの遅れで後ろが伸びる）
+    date: 2026-11-03
+  - path: results/still.png
+    caption: 静止時の表示（スマホ幅 390px）
+    date: 2026-11-03
+links:
+  - label: GitHub Pages
+    url: https://tsumikiroom.github.io/smear-jump/
+started: 2026-11-03
+updated: 2026-11-03
