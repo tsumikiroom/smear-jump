@@ -1,5 +1,12 @@
 # smear-jump log
 
+## 2026-11-03（鳥）
+
+やったこと
+- ユーザーの「鳥入れて」で、羽ばたく鳥の切り抜きループ（24コマ、224px の 6×4）を `assets/bird_atlas.png` に追加し、絵の選択に足した（素材は技術スケッチで MiniMax H3 生成した切り抜き）
+- 絵のボタンの並びを MOVIES の順（馬→鳥→描いた絵）に固定
+- 390px 幅で `results/still-bird.png` `results/moving-bird.png` を撮り、コンソールのエラー0件を確認
+
 ## 2026-11-03
 
 やったこと
