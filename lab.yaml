@@ -3,9 +3,10 @@ title: Smear Jump（タップで飛ぶ変形スミア）
 status: active
 priority: 2
 stage: prototype
-summary: タップした位置へ絵が飛び、帯ごとに遅れて引き伸ばされる変形スミアのWebデモ。WebGL2の1枚HTMLで、スマホ幅での表示を確認済み
+summary: タップした位置へ絵が飛び、帯ごとに遅れて引き伸ばされる変形スミアのWebデモ。WebGL2の1枚HTMLで、既定は走る馬の動く絵（再生中のコマがそのまま伸びる）
 question: 手描きアニメのスミアを、どこまで軽い仕組みでリアルタイムに再現できるか
 next:
+  - 動く絵を、個人の環境で生成した素材（跳ねる動物）に差し替える
   - 実機のスマホで操作感（タップ・つまみ・速度）を確かめる
   - 弧と回転を大きくしたときの尾の崩れ方を詰める
   - GitHub Pages で公開する
@@ -13,8 +14,14 @@ blocked_by: ""
 related: []
 knowledge: []
 tags: [webgl2, glsl, animation, smear, mobile]
-cover: results/moving.png
+cover: results/moving-horse.png
 outputs:
+  - path: results/moving-horse.png
+    caption: 動く絵（走る馬）の移動中のスミア（スマホ幅 390px）
+    date: 2026-11-03
+  - path: results/still-horse.png
+    caption: 動く絵（走る馬）の静止時（スマホ幅 390px）
+    date: 2026-11-03
   - path: results/moving.png
     caption: 移動中のスミア（帯ごとの遅れで後ろが伸びる）
     date: 2026-11-03

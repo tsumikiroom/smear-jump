@@ -83,7 +83,9 @@ precision highp float;
 precision highp int;
 
 uniform sampler2D uPic;     // premultiplied picture, y up
-uniform sampler2D uFront;   // per row of the jump frame: first opaque x seen from the leading side
+uniform sampler2D uFront;   // per row of the jump frame (x) and per picture frame (y): first opaque x seen from the leading side
+uniform int   uFrame;       // which row of uFront / which tile of the atlas is showing
+uniform vec4  uTile;        // atlas tile: offset.xy, scale.xy in texture coordinates (0,0,1,1 for single pictures)
 uniform vec2  uView;        // drawing buffer size in pixels
 uniform vec2  uFrom;        // jump start (screen units: height 1, origin at centre)
 uniform vec2  uDir;         // cos, sin of the jump heading
@@ -124,7 +126,7 @@ float frontAt(float y) {
   int n = textureSize(uFront, 0).x;
   float f = (y + reach) / (2.0 * reach);
   if (f < 0.0 || f >= 1.0) return 1e9;
-  return texelFetch(uFront, ivec2(int(f * float(n)), 0), 0).r * uSize;
+  return texelFetch(uFront, ivec2(int(f * float(n)), uFrame), 0).r * uSize;
 }
 
 void main() {
@@ -153,7 +155,7 @@ void main() {
 
   vec2 uv = vec2(uTurn.x * qx - uTurn.y * y, uTurn.y * qx + uTurn.x * y) / uSize + 0.5;
   vec4 c = vec4(0.0);
-  if (all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)))) c = texture(uPic, uv);
+  if (all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)))) c = texture(uPic, uTile.xy + uv * uTile.zw);
   outColor = vec4(c.rgb + uPaper * (1.0 - c.a), 1.0);
 }
 </script>
@@ -237,7 +239,41 @@ for (const [name, draw] of Object.entries(PICS)) {
   const alpha = new Uint8Array(TEX * TEX);      // y up, to match the texture
   for (let y = 0; y < TEX; y++)
     for (let x = 0; x < TEX; x++) alpha[y * TEX + x] = data[((TEX - 1 - y) * TEX + x) * 4 + 3];
-  pictures[name] = { canvas: c, alpha };
+  pictures[name] = { canvas: c, frames: [alpha], size: TEX, tiles: [[0, 0, 1, 1]], fps: 0 };
+}
+
+// Moving picture: a looping sequence of cut-out frames packed into one atlas (left to right, top to bottom).
+// The frame alpha is read once on load so the leading-edge table can be built for every frame.
+const MOVIES = { horse: { src: 'assets/horse_atlas.png', cols: 6, rows: 4, count: 24, fps: 12 } };
+function loadMovie(name, m) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => { try {
+      const tw = img.width / m.cols, th = img.height / m.rows;
+      const c = document.createElement('canvas');
+      c.width = img.width; c.height = img.height;
+      const g = c.getContext('2d', { willReadFrequently: true });
+      g.drawImage(img, 0, 0);
+      const data = g.getImageData(0, 0, c.width, c.height).data;
+      const frames = [], tiles = [];
+      for (let i = 0; i < m.count; i++) {
+        const ox = (i % m.cols) * tw, oy = Math.floor(i / m.cols) * th;
+        const alpha = new Uint8Array(tw * th);   // y up, to match the texture
+        for (let y = 0; y < th; y++)
+          for (let x = 0; x < tw; x++) alpha[y * tw + x] = data[((oy + th - 1 - y) * c.width + ox + x) * 4 + 3];
+        frames.push(alpha);
+        // after the upload flip, row 0 of the atlas sits at the top of texture space
+        tiles.push([(ox + 0.5) / c.width, 1 - (oy + th - 0.5) / c.height, (tw - 1) / c.width, (th - 1) / c.height]);
+      }
+      const thumb = document.createElement('canvas');
+      thumb.width = thumb.height = tw;
+      thumb.getContext('2d').drawImage(img, 0, 0, tw, th, 0, 0, tw, th);
+      pictures[name] = { canvas: c, frames, size: tw, tiles, fps: m.fps, thumb };
+      resolve();
+    } catch (e) { reject(e); } };   // e.g. pixels unreadable when opened as a local file
+    img.onerror = () => reject(new Error('could not load ' + m.src));
+    img.src = m.src;
+  });
 }
 
 // ---------- WebGL ----------
@@ -287,30 +323,34 @@ function usePicture(name) {
   gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
   frontKey = '';
 }
+const frameNow = () => current.fps ? Math.floor(clock * current.fps) % current.frames.length : 0;
 
 // Leading-edge table. For each row of the jump frame (y across the heading),
 // march from the leading side (+x) and keep the x of the first opaque pixel,
 // in units of the picture size. Only rebuilt when the relative angle changes.
-const frontBuf = new Float32Array(FRONT_ROWS);
+let frontBuf = new Float32Array(FRONT_ROWS);
 let frontKey = '';
 function buildFronts(c, s) {
   const key = c.toFixed(4) + ',' + s.toFixed(4);
   if (key === frontKey) return;
   frontKey = key;
-  const reach = 0.7072, steps = FRONT_ROWS, a = current.alpha;
-  for (let i = 0; i < FRONT_ROWS; i++) {
-    const y = ((i + 0.5) / FRONT_ROWS * 2 - 1) * reach;
-    let hit = 1e9;
-    for (let j = 0; j < steps; j++) {
-      const x = reach * (1 - 2 * (j + 0.5) / steps);
-      const u = c * x - s * y + 0.5, v = s * x + c * y + 0.5;
-      if (u < 0 || u >= 1 || v < 0 || v >= 1) continue;
-      if (a[(v * TEX | 0) * TEX + (u * TEX | 0)] > 127) { hit = x; break; }
+  const reach = 0.7072, steps = FRONT_ROWS, n = current.size, frames = current.frames;
+  if (frontBuf.length !== FRONT_ROWS * frames.length) frontBuf = new Float32Array(FRONT_ROWS * frames.length);
+  frames.forEach((a, f) => {           // one row of the table per picture frame
+    for (let i = 0; i < FRONT_ROWS; i++) {
+      const y = ((i + 0.5) / FRONT_ROWS * 2 - 1) * reach;
+      let hit = 1e9;
+      for (let j = 0; j < steps; j++) {
+        const x = reach * (1 - 2 * (j + 0.5) / steps);
+        const u = c * x - s * y + 0.5, v = s * x + c * y + 0.5;
+        if (u < 0 || u >= 1 || v < 0 || v >= 1) continue;
+        if (a[(v * n | 0) * n + (u * n | 0)] > 127) { hit = x; break; }
+      }
+      frontBuf[f * FRONT_ROWS + i] = hit;
     }
-    frontBuf[i] = hit;
-  }
+  });
   gl.activeTexture(gl.TEXTURE1);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, FRONT_ROWS, 1, 0, gl.RED, gl.FLOAT, frontBuf);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, FRONT_ROWS, frames.length, 0, gl.RED, gl.FLOAT, frontBuf);
 }
 
 // ---------- motion ----------
@@ -357,6 +397,9 @@ fit();
 function draw() {
   const h = heading(), rel = h - rotation();
   buildFronts(Math.cos(rel), Math.sin(rel));
+  const frame = frameNow();
+  gl.uniform1i(loc.uFrame, frame);
+  gl.uniform4fv(loc.uTile, current.tiles[frame]);
   gl.uniform2f(loc.uView, cv.width, cv.height);
   gl.uniform2f(loc.uFrom, jump.fx, jump.fy);
   gl.uniform2f(loc.uDir, Math.cos(h), Math.sin(h));
@@ -386,17 +429,19 @@ function tick(now) {
 
 // ---------- dock ----------
 const picBox = document.getElementById('pics');
-Object.keys(pictures).forEach((name, i) => {
-  const b = document.createElement('button');
-  b.setAttribute('aria-label', name);
-  const thumb = document.createElement('canvas');
-  thumb.width = thumb.height = 96;
-  thumb.getContext('2d').drawImage(pictures[name].canvas, 0, 0, 96, 96);
-  b.appendChild(thumb);
-  b.onclick = () => { picBox.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b)); usePicture(name); };
-  if (i === 0) b.classList.add('on');
-  picBox.appendChild(b);
-});
+function addButtons() {             // moving pictures first
+  const names = Object.keys(pictures).sort((a, b) => (pictures[b].fps > 0) - (pictures[a].fps > 0));
+  names.forEach(name => {
+    const b = document.createElement('button');
+    b.setAttribute('aria-label', name);
+    const thumb = document.createElement('canvas');
+    thumb.width = thumb.height = 96;
+    thumb.getContext('2d').drawImage(pictures[name].thumb || pictures[name].canvas, 0, 0, 96, 96);
+    b.appendChild(thumb);
+    b.onclick = () => { picBox.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b)); usePicture(name); };
+    picBox.appendChild(b);
+  });
+}
 
 const speedBtns = document.querySelectorAll('#speed button');
 function setRate(v) {
@@ -426,17 +471,23 @@ toggle.onclick = () => setKnobs(!knobBox.classList.contains('open'));
 // ---------- start ----------
 // URL options for reproducible stills, e.g. ?pic=star&tap=0.75,0.25&t=0.2&arc=0.4
 // tap = target as fractions of the screen (from top-left), t = freeze at this many seconds into the jump.
-const firstPic = pictures[q.get('pic')] ? q.get('pic') : 'word';
-picBox.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.getAttribute('aria-label') === firstPic));
-usePicture(firstPic);
-if (q.get('knobs') === '1') setKnobs(true);
-if (q.has('tap')) {
-  const [u, v] = q.get('tap').split(',').map(Number);
-  tapAt(u, v);
-  if (q.has('seed')) jump.seed = parseInt(q.get('seed'), 10) >>> 0;
-  if (q.has('t')) { clock = jump.start + parseFloat(q.get('t')); setRate(0); }
+async function start() {
+  try { await Promise.all(Object.entries(MOVIES).map(([name, m]) => loadMovie(name, m))); }
+  catch (e) { console.warn(e.message + ' — showing the drawn pictures only'); }
+  addButtons();
+  const firstPic = pictures[q.get('pic')] ? q.get('pic') : (pictures.horse ? 'horse' : 'word');
+  picBox.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.getAttribute('aria-label') === firstPic));
+  usePicture(firstPic);
+  if (q.get('knobs') === '1') setKnobs(true);
+  if (q.has('tap')) {
+    const [u, v] = q.get('tap').split(',').map(Number);
+    tapAt(u, v);
+    if (q.has('seed')) jump.seed = parseInt(q.get('seed'), 10) >>> 0;
+    if (q.has('t')) { clock = jump.start + parseFloat(q.get('t')); setRate(0); }
+  }
+  requestAnimationFrame(tick);
 }
-requestAnimationFrame(tick);
+start();
 </script>
 </body>
 </html>
